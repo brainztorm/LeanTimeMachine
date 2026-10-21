@@ -1,0 +1,805 @@
+#!/usr/bin/env bash
+# LeanTimeMachine - lighter Time Machine backups for macOS
+# LeanTimeMachine - sauvegardes Time Machine allégées pour macOS
+#
+# EN: fixed-path exclusions (config/rules.conf) + hourly background agent (project-folder exclusions, single local snapshot).
+# FR: exclusions de chemins fixes (config/rules.conf) + agent horaire en arrière-plan (exclusions de projets, un seul snapshot local).
+set -u
+# EN: a user-defined CDPATH would make "cd" print paths and corrupt the values computed below.
+# FR: un CDPATH défini par l'utilisateur ferait afficher des chemins à "cd" et fausserait les valeurs ci-dessous.
+unset CDPATH
+
+VERSION="2.3.0"
+PREFS="/Library/Preferences/com.apple.TimeMachine"   # EN: preference domain / FR : domaine de préférences
+PLIST="$PREFS.plist"
+
+# EN: follow symlinks (e.g. ~/.local/bin/leantimemachine -> project) to locate the project folder.
+# FR: suit les liens symboliques (ex. ~/.local/bin/leantimemachine -> projet) pour retrouver le projet.
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  LINK="$(readlink "$SRC")"
+  case "$LINK" in /*) SRC="$LINK" ;; *) SRC="$(dirname "$SRC")/$LINK" ;; esac
+done
+ROOT="$(cd "$(dirname "$SRC")/.." && pwd)"
+CONFIG="$ROOT/config/rules.conf"
+SELF="$(cd "$(dirname "$SRC")" && pwd)/$(basename "$SRC")"
+LABEL="com.leantimemachine.maintenance"
+# EN: the hourly job is a launchd *agent* running as the current user: no root needed for it.
+#     (tmutil localsnapshot / deletelocalsnapshots / sticky addexclusion work without root; only
+#     "addexclusion -p" and "enable" need sudo, and only when you run apply / install.)
+# FR: la tâche horaire est un *agent* launchd qui tourne sous l'utilisateur : pas de root pour elle.
+#     (tmutil localsnapshot / deletelocalsnapshots / addexclusion « sticky » fonctionnent sans root ;
+#     seuls « addexclusion -p » et « enable » demandent sudo, et seulement quand vous lancez apply / install.)
+APP_DIR="$HOME/Library/Application Support/LeanTimeMachine"
+INSTALLED="$APP_DIR/leantimemachine"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+AGENT_DOMAIN="gui/$(id -u)"
+LOG="$HOME/Library/Logs/LeanTimeMachine.log"
+SHOW_SIZE=1
+CREATE=0
+REMOVE_EXCL=0
+CMD=""
+
+# EN: message language: LEANTIMEMACHINE_LANG (en|fr) > LC_ALL > LC_MESSAGES > macOS system language > LANG > English.
+#     Log lines stay in English (stable format, parsed by doctor).
+# FR: langue des messages : LEANTIMEMACHINE_LANG (en|fr) > LC_ALL > LC_MESSAGES > langue du système macOS > LANG > anglais.
+#     Les lignes du journal restent en anglais (format stable, lu par doctor).
+detect_lang() {
+  local l="${LEANTIMEMACHINE_LANG:-}"
+  [ -n "$l" ] || l="${LC_ALL:-}"
+  [ -n "$l" ] || l="${LC_MESSAGES:-}"
+  [ -n "$l" ] || l="$(defaults read -g AppleLanguages 2>/dev/null | sed -n 's/^ *"\{0,1\}\([a-zA-Z][a-zA-Z]\).*/\1/p' | head -n 1)"
+  [ -n "$l" ] || l="${LANG:-}"
+  case "$l" in fr*|FR*) echo fr ;; *) echo en ;; esac
+}
+LANG_CODE="$(detect_lang)"
+# EN: T "english" "french": returns the text for the current language.
+# FR: T "anglais" "français" : renvoie le texte de la langue courante.
+T() { if [ "$LANG_CODE" = fr ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+usage() {
+  if [ "$LANG_CODE" = fr ]; then
+    cat <<USAGE
+LeanTimeMachine $VERSION - sauvegardes Time Machine allégées
+
+Usage : leantimemachine <commande> [options]
+
+Automatisation :
+  install     Installe l'agent horaire (exclusions de projets + un seul snapshot local, sans root),
+              applique rules.conf et active Time Machine si besoin (sudo pour ces deux étapes)
+  uninstall   Retire l'agent (Time Machine reste tel quel). --remove-exclusions retire aussi les exclusions
+  doctor      Fait le point : ce qui va, ce qui ne va pas, et la commande pour corriger
+  run         Lance maintenant le passage horaire de l'agent (sans sudo)
+
+Exclusions de chemins fixes (config/rules.conf) :
+  status   État de chaque règle (sans sudo)
+  apply    Applique les exclusions (sudo tmutil addexclusion -p)
+  remove   Retire les exclusions des règles (sudo tmutil removeexclusion -p)
+  list     Affiche SkipPaths (exclusions fixes actuelles, sans sudo)
+  diff     Règles à appliquer / déjà exclues / absentes
+  help     Cette aide
+
+Options :
+  -c, --config FICHIER   Fichier de règles (défaut : config/rules.conf)
+  --no-size              status : ne calcule pas les tailles (plus rapide)
+  --create               apply : crée les dossiers absents avant de les exclure
+  --remove-exclusions    uninstall : retire aussi les exclusions (rules.conf + dossiers de projets)
+
+Langue : automatique (LC_ALL, puis langue du système macOS) ; forcer avec LEANTIMEMACHINE_LANG=en|fr
+USAGE
+  else
+    cat <<USAGE
+LeanTimeMachine $VERSION - lighter Time Machine backups
+
+Usage: leantimemachine <command> [options]
+
+Automation:
+  install     Install the hourly agent (project-folder exclusions + a single local snapshot, no root),
+              apply rules.conf and enable Time Machine if needed (sudo for these two steps)
+  uninstall   Remove the agent (Time Machine is left as is). --remove-exclusions also removes the exclusions
+  doctor      Health check: what is fine, what is wrong, and the command to fix it
+  run         Run the agent's hourly job now (no sudo)
+
+Fixed-path exclusions (config/rules.conf):
+  status   State of every rule (no sudo)
+  apply    Apply the exclusions (sudo tmutil addexclusion -p)
+  remove   Remove the exclusions of the rules (sudo tmutil removeexclusion -p)
+  list     Show SkipPaths (current fixed exclusions, no sudo)
+  diff     Rules to apply / already excluded / absent
+  help     This help
+
+Options:
+  -c, --config FILE      Rules file (default: config/rules.conf)
+  --no-size              status: do not compute sizes (faster)
+  --create               apply: create missing folders before excluding them
+  --remove-exclusions    uninstall: also remove exclusions (rules.conf + project folders)
+
+Language: automatic (LC_ALL, then macOS system language); force with LEANTIMEMACHINE_LANG=en|fr
+USAGE
+  fi
+}
+
+die() { echo "leantimemachine: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    status|apply|remove|list|diff|install|uninstall|doctor|run)
+      [ -z "$CMD" ] || die "$(T "only one command at a time (got '$CMD' and '$1')" "une seule commande à la fois ('$CMD' et '$1')")"
+      CMD="$1" ;;
+    help|-h|--help) usage; exit 0 ;;
+    --no-size) SHOW_SIZE=0 ;;
+    --create) CREATE=1 ;;
+    --remove-exclusions) REMOVE_EXCL=1 ;;
+    -c|--config)
+      shift
+      case "${1:-}" in ''|-*) die "$(T "--config needs a file" "--config requiert un fichier")" ;; esac
+      CONFIG="$1" ;;
+    *) usage >&2; die "$(T "unknown argument: $1" "argument inconnu : $1")" ;;
+  esac
+  shift
+done
+[ -n "$CMD" ] || { usage; exit 1; }
+[ "$(uname)" = "Darwin" ] || die "$(T "macOS only" "macOS uniquement")"
+
+# ---------------------------------------------------------------------------
+# EN: prerequisites / FR : prérequis
+# ---------------------------------------------------------------------------
+
+# EN: the rules file must exist (checked up front: "die" inside a < <(read_rules) subshell would not stop the program).
+# FR: le fichier de règles doit exister (vérifié d'emblée : un "die" dans un sous-shell < <(read_rules) n'arrêterait pas le programme).
+require_config() {
+  [ -f "$CONFIG" ] || die "$(T "config not found: $CONFIG" "config introuvable : $CONFIG")"
+}
+
+# EN: "tmutil addexclusion -p / removeexclusion / enable" need Full Disk Access for the terminal.
+#     Probe: the Time Machine preferences file can only be read when the terminal has it.
+# FR: « tmutil addexclusion -p / removeexclusion / enable » exigent l'Accès complet au disque pour le terminal.
+#     Sonde : le fichier de préférences Time Machine n'est lisible que si le terminal l'a.
+has_fda() { head -c 1 "$PLIST" >/dev/null 2>&1; }
+
+fda_message() {
+  T "Your terminal needs Full Disk Access (tmutil refuses to change Time Machine settings without it).
+  1. Open System Settings > Privacy & Security > Full Disk Access
+  2. Add your terminal app (Terminal, iTerm, Ghostty, Warp...) and switch it on
+  3. Quit the terminal completely (Cmd+Q) and open it again, then re-run this command" \
+    "Votre terminal a besoin de l'Accès complet au disque (tmutil refuse de modifier les réglages Time Machine sans lui).
+  1. Ouvrez Réglages Système > Confidentialité et sécurité > Accès complet au disque
+  2. Ajoutez votre application de terminal (Terminal, iTerm, Ghostty, Warp...) et activez-la
+  3. Quittez complètement le terminal (Cmd+Q), rouvrez-le, puis relancez cette commande"
+}
+
+require_fda() { has_fda || die "$(fda_message)"; }
+
+# EN: defense in depth: if tmutil itself complains about Full Disk Access (the probe above can be wrong),
+#     stop with the same explanation instead of printing a list of unexplained failures.
+# FR: défense en profondeur : si tmutil lui-même se plaint de l'Accès complet au disque (la sonde ci-dessus peut se
+#     tromper), on s'arrête avec la même explication au lieu d'afficher une liste d'échecs inexpliqués.
+die_if_fda_error() { case "$1" in *"Full Disk Access"*) die "$(fda_message)" ;; esac; }
+
+# EN: reminder for read-only commands: they work, but the next step (apply) will be refused.
+# FR: rappel pour les commandes en lecture seule : elles fonctionnent, mais l'étape suivante (apply) sera refusée.
+fda_notice() {
+  has_fda && return 0
+  echo
+  echo "! $(T "Note: this terminal has no Full Disk Access, so 'apply', 'remove' and 'install' will be refused by macOS." "Note : ce terminal n'a pas l'Accès complet au disque, donc 'apply', 'remove' et 'install' seront refusés par macOS.")"
+  echo "  $(T "How to fix it: leantimemachine doctor" "Pour corriger : leantimemachine doctor")"
+}
+
+# EN: the hourly agent is a different program for macOS (/bin/bash): it needs its own Full Disk Access to read
+#     protected folders such as Desktop and Documents. The terminal's access does not apply to it.
+# FR: l'agent horaire est un autre programme pour macOS (/bin/bash) : il lui faut son propre Accès complet au disque
+#     pour lire des dossiers protégés comme Desktop et Documents. L'accès du terminal ne s'applique pas à lui.
+agent_fda_message() {
+  T "The background agent cannot read some protected folders (Desktop, Documents...): they are NOT being scanned.
+  1. Open System Settings > Privacy & Security > Full Disk Access
+  2. Click +, press Cmd+Shift+G, type /bin/bash, choose it, and switch it on
+  3. Restart the agent: launchctl kickstart -k $AGENT_DOMAIN/$LABEL   (wait ~10 s, then: leantimemachine doctor)
+  (A manual 'leantimemachine run' uses your terminal's access, not the agent's: it does not prove the agent works.)" \
+    "L'agent en arrière-plan ne peut pas lire certains dossiers protégés (Desktop, Documents...) : ils NE SONT PAS scannés.
+  1. Ouvrez Réglages Système > Confidentialité et sécurité > Accès complet au disque
+  2. Cliquez sur +, tapez Cmd+Maj+G, saisissez /bin/bash, choisissez-le et activez-le
+  3. Relancez l'agent : launchctl kickstart -k $AGENT_DOMAIN/$LABEL   (attendez ~10 s, puis : leantimemachine doctor)
+  (Un 'leantimemachine run' manuel utilise l'accès de votre terminal, pas celui de l'agent : il ne prouve pas que l'agent fonctionne.)"
+}
+
+# EN: read the rules, one per line, with ~, $HOME and ${HOME} expanded and trailing slashes removed.
+# FR: lit les règles, une par ligne, avec ~, $HOME et ${HOME} développés et les slashs finaux retirés.
+read_rules() {
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    # shellcheck disable=SC2016,SC2088  # comparison patterns, not expansions / motifs de comparaison, pas des expansions
+    case "$line" in
+      '~'|'$HOME'|'${HOME}') line="$HOME" ;;
+      '~/'*) line="$HOME/${line#\~/}" ;;
+      '$HOME/'*) line="$HOME/${line#\$HOME/}" ;;
+      '${HOME}/'*) line="$HOME/${line#\$\{HOME\}/}" ;;
+    esac
+    while [ "${#line}" -gt 1 ] && [ "${line%/}" != "$line" ]; do line="${line%/}"; done
+    printf '%s\n' "$line"
+  done < "$CONFIG"
+}
+
+# EN: current SkipPaths, one per line. "defaults export" goes through cfprefsd: it needs neither sudo nor
+#     Full Disk Access and always returns the up-to-date value (reading the plist file directly is denied).
+# FR: SkipPaths actuels, un par ligne. « defaults export » passe par cfprefsd : ni sudo ni Accès complet au
+#     disque, et la valeur est toujours à jour (la lecture directe du fichier plist est refusée).
+skip_paths() {
+  local xml n i=0
+  xml="$(defaults export "$PREFS" - 2>/dev/null)" || return 0
+  n="$(printf '%s' "$xml" | plutil -extract SkipPaths raw - 2>/dev/null)" || return 0
+  case "$n" in ''|*[!0-9]*) return 0 ;; esac
+  while [ "$i" -lt "$n" ]; do
+    printf '%s\n' "$(printf '%s' "$xml" | plutil -extract "SkipPaths.$i" raw - 2>/dev/null)"
+    i=$((i+1))
+  done
+}
+
+# EN: in_snap SNAPSHOT PATH: is PATH in a SkipPaths snapshot taken earlier (pure bash, no fork).
+# FR: in_snap INSTANTANÉ CHEMIN : CHEMIN figure-t-il dans un instantané de SkipPaths pris plus tôt (bash pur).
+in_snap() { case $'\n'"$1"$'\n' in *$'\n'"$2"$'\n'*) return 0 ;; esac; return 1; }
+
+# EN: excluded according to tmutil (source of truth, no privileges needed). Includes macOS built-in exclusions.
+# FR: exclu selon tmutil (source de vérité, sans privilèges). Inclut les exclusions natives de macOS.
+is_excluded() { tmutil isexcluded "$1" 2>/dev/null | grep -q '^\[Excluded\]'; }
+
+# EN: classify_rules fills TODO / DONE / ABS_TODO (lists) and N_TODO / N_DONE / N_ABS_TODO / N_ABS_DONE (counters).
+#     TODO = exists and still backed up; DONE = exists and excluded; ABS_TODO = absent and not yet registered.
+# FR: classify_rules remplit TODO / DONE / ABS_TODO (listes) et N_TODO / N_DONE / N_ABS_TODO / N_ABS_DONE (compteurs).
+#     TODO = existe et encore sauvegardé ; DONE = existe et exclu ; ABS_TODO = absent et pas encore inscrit.
+classify_rules() {
+  local p snap
+  TODO=""; DONE=""; ABS_TODO=""; N_TODO=0; N_DONE=0; N_ABS_TODO=0; N_ABS_DONE=0
+  snap="$(skip_paths)"
+  while IFS= read -r p; do
+    if [ -e "$p" ]; then
+      if is_excluded "$p"; then DONE="$DONE$p"$'\n'; N_DONE=$((N_DONE+1))
+      else TODO="$TODO$p"$'\n'; N_TODO=$((N_TODO+1)); fi
+    elif in_snap "$snap" "$p"; then N_ABS_DONE=$((N_ABS_DONE+1))
+    else ABS_TODO="$ABS_TODO$p"$'\n'; N_ABS_TODO=$((N_ABS_TODO+1)); fi
+  done < <(read_rules)
+}
+
+human() { # EN: KB -> text / FR : Ko -> texte
+  awk -v k="$1" 'BEGIN{
+    split("K M G T",u," "); i=1; v=k
+    while (v>=1024 && i<4) { v/=1024; i++ }
+    if (i==1) printf "%dK", v; else printf "%.1f%s", v, u[i] }'
+}
+
+size_kb() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+cmd_status() {
+  require_config
+  local total=0 p sz snap n_inc=0 n_exc=0 n_abs=0 n_reg=0
+  snap="$(skip_paths)"
+  while IFS= read -r p; do
+    if [ ! -e "$p" ]; then
+      if in_snap "$snap" "$p"; then printf '%-12s %7s   %s\n' "$(T "[REGISTERED]" "[INSCRIT]")" "-" "$p"; n_reg=$((n_reg+1))
+      else printf '%-12s %7s   %s\n' "[ABSENT]" "-" "$p"; n_abs=$((n_abs+1)); fi
+      continue
+    fi
+    if is_excluded "$p"; then
+      printf '%-12s %7s   %s\n' "$(T "[EXCLUDED]" "[EXCLU]")" "-" "$p"; n_exc=$((n_exc+1)); continue
+    fi
+    sz="?"
+    if [ "$SHOW_SIZE" = 1 ]; then
+      local kb; kb="$(size_kb "$p")"; kb="${kb:-0}"
+      total=$((total+kb)); sz="$(human "$kb")"
+    fi
+    printf '%-12s %7s   %s\n' "$(T "[INCLUDED]" "[INCLUS]")" "$sz" "$p"; n_inc=$((n_inc+1))
+  done < <(read_rules)
+  echo
+  echo "$(T "Included: $n_inc  Excluded: $n_exc  Absent: $n_abs (not registered), $n_reg (registered)" "Inclus : $n_inc  Exclus : $n_exc  Absents : $n_abs (non inscrits), $n_reg (inscrits)")"
+  [ "$SHOW_SIZE" = 1 ] && echo "$(T "Space to save" "Volume à économiser") : $(human "$total")"
+  fda_notice
+  return 0
+}
+
+# EN: show a tmutil error, indented / FR : affiche une erreur de tmutil, indentée
+show_err() { printf '%s\n' "$1" | sed 's/^/             /'; }
+
+cmd_apply() {
+  require_config; require_fda
+  sudo -v || die "$(T "sudo required" "sudo requis")"
+  local p ok=0 skip=0 fail=0 snap err
+  snap="$(skip_paths)"
+  while IFS= read -r p; do
+    if [ ! -e "$p" ] && [ "$CREATE" = 1 ]; then
+      mkdir -p "$p" || { echo "$(T "[FAILED]  " "[ECHEC]   ") $p (mkdir)"; fail=$((fail+1)); continue; }
+    fi
+    if [ ! -e "$p" ]; then
+      # EN: absent path (software uninstalled or not installed yet): register it in SkipPaths anyway.
+      #     No fallback that writes the preferences directly: if tmutil refuses, it is reported as FAILED.
+      # FR: chemin absent (logiciel désinstallé ou pas encore installé) : on l'inscrit quand même dans SkipPaths.
+      #     Pas de repli qui écrit directement les préférences : si tmutil refuse, c'est signalé comme ECHEC.
+      if in_snap "$snap" "$p"; then echo "$(T "[ALREADY] " "[DEJA]    ") $p (absent)"; skip=$((skip+1)); continue; fi
+      err="$(sudo tmutil addexclusion -p "$p" 2>&1)" || err="${err:-failed}"
+      die_if_fda_error "$err"
+      if in_snap "$(skip_paths)" "$p"; then echo "[OK]       $p (absent)"; ok=$((ok+1))
+      else echo "$(T "[FAILED]  " "[ECHEC]   ") $p (absent)"; show_err "$err"; fail=$((fail+1)); fi
+      continue
+    fi
+    if in_snap "$snap" "$p" && is_excluded "$p"; then
+      echo "$(T "[ALREADY] " "[DEJA]    ") $p"; skip=$((skip+1)); continue
+    fi
+    if err="$(sudo tmutil addexclusion -p "$p" 2>&1)" && is_excluded "$p"; then
+      echo "[OK]       $p"; ok=$((ok+1))
+    else
+      die_if_fda_error "$err"
+      echo "$(T "[FAILED]  " "[ECHEC]   ") $p"; show_err "$err"; fail=$((fail+1))
+    fi
+  done < <(read_rules)
+  echo; echo "$(T "Applied: $ok  Already done: $skip  Failed: $fail" "Appliqués : $ok  Déjà faits : $skip  Échecs : $fail")"
+  [ "$fail" = 0 ]
+}
+
+# EN: only fixed-path exclusions (SkipPaths) are removed: that is what apply registered.
+#     Built-in macOS exclusions and sticky ones are not touched.
+# FR: seules les exclusions de chemin fixe (SkipPaths) sont retirées : ce que apply a inscrit.
+#     Les exclusions natives de macOS et les « sticky » ne sont pas touchées.
+cmd_remove() {
+  require_config; require_fda
+  sudo -v || die "$(T "sudo required" "sudo requis")"
+  local p ok=0 fail=0 snap err tag
+  snap="$(skip_paths)"
+  while IFS= read -r p; do
+    in_snap "$snap" "$p" || continue
+    tag=""; [ -e "$p" ] || tag=" (absent)"
+    err="$(sudo tmutil removeexclusion -p "$p" 2>&1)" || err="${err:-failed}"
+    die_if_fda_error "$err"
+    if in_snap "$(skip_paths)" "$p"; then
+      echo "$(T "[FAILED]  " "[ECHEC]   ") $p$tag"; show_err "$err"; fail=$((fail+1))
+    else echo "$(T "[REMOVED] " "[RETIRE]  ") $p$tag"; ok=$((ok+1)); fi
+  done < <(read_rules)
+  echo; echo "$(T "Removed: $ok  Failed: $fail" "Retirés : $ok  Échecs : $fail")"
+  [ "$fail" = 0 ]
+}
+
+cmd_list() {
+  local out; out="$(skip_paths)"
+  if [ -z "$out" ]; then echo "$(T "No fixed-path exclusion registered (SkipPaths is empty)." "Aucune exclusion de chemin fixe inscrite (SkipPaths est vide).")"
+  else printf '%s\n' "$out"; fi
+}
+
+cmd_diff() {
+  require_config
+  classify_rules
+  local p
+  echo "$(T "To exclude ($N_TODO): present on disk, still backed up" "À exclure ($N_TODO) : présents sur le disque, encore sauvegardés")"
+  if [ "$N_TODO" = 0 ]; then echo "  $(T "(none)" "(aucun)")"; else printf '%s' "$TODO" | while IFS= read -r p; do echo "+ $p"; done; fi
+  echo
+  echo "$(T "Absent from disk, not yet registered ($N_ABS_TODO): apply registers them so they are excluded once installed" "Absents du disque, pas encore inscrits ($N_ABS_TODO) : apply les inscrit pour qu'ils soient exclus dès leur installation")"
+  if [ "$N_ABS_TODO" = 0 ]; then echo "  $(T "(none)" "(aucun)")"; else printf '%s' "$ABS_TODO" | while IFS= read -r p; do echo "~ $p"; done; fi
+  echo
+  echo "$(T "Already excluded ($N_DONE)" "Déjà exclus ($N_DONE)")"
+  if [ "$N_DONE" = 0 ]; then echo "  $(T "(none)" "(aucun)")"; else printf '%s' "$DONE" | while IFS= read -r p; do echo "= $p"; done; fi
+  echo
+  echo "$(T "Absent and already registered: $N_ABS_DONE" "Absents et déjà inscrits : $N_ABS_DONE")"
+  fda_notice
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# EN: development project folders (variable paths) + local snapshots
+# FR: dossiers de projets de développement (chemins variables) + snapshots locaux
+# ---------------------------------------------------------------------------
+
+# EN: write a log line (also shown on screen when run from a terminal).
+# FR: écrit une ligne de journal (affichée aussi à l'écran si lancé depuis un terminal).
+log() {
+  local line; line="$(date '+%F %T') $*"
+  printf '%s\n' "$line" >> "$LOG"
+  [ -t 1 ] && printf '%s\n' "$line"
+  return 0
+}
+
+# EN: names of generated folders looked for. A name alone is never enough for the ambiguous ones: has_marker
+#     must confirm them with a file of the project. Covered ecosystems: JavaScript/TypeScript, HTML/CSS tooling,
+#     Python, Java/Kotlin, C/C++, PHP, Go, Rust, Swift, Ruby, Lua, Scala, Dart, Terraform.
+#     Nothing to exclude for SQL and Bash/Shell.
+# FR: noms des dossiers générés recherchés. Pour les noms ambigus, un nom seul ne suffit jamais : has_marker doit
+#     les confirmer par un fichier du projet. Écosystèmes couverts : JavaScript/TypeScript, outils HTML/CSS,
+#     Python, Java/Kotlin, C/C++, PHP, Go, Rust, Swift, Ruby, Lua, Scala, Dart, Terraform.
+#     Rien à exclure pour SQL et Bash/Shell.
+#
+# EN: SURE = specific names: accepted alone, and find does not descend into them.
+# FR: SURE = noms spécifiques : acceptés seuls, et find ne descend pas dedans.
+SCAN_NAMES_SURE='node_modules .gradle .next .nuxt .turbo .parcel-cache .svelte-kit .sass-cache .venv
+.tox .nox .pytest_cache .mypy_cache .ruff_cache .ipynb_checkpoints CMakeFiles lua_modules .terraform .dart_tool'
+# EN: AMBIGUOUS = common names: only accepted with a marker; find still descends into them, so that
+#     projects stored below e.g. a plain "vendor" or "env" folder are found.
+# FR: AMBIGUS = noms courants : acceptés seulement avec un marqueur ; find descend quand même dedans, pour
+#     retrouver les projets rangés sous un simple dossier « vendor » ou « env ».
+SCAN_NAMES_AMBIGUOUS='dist venv env *.egg-info target build .kotlin out cmake-build-* builddir .cache .build .angular vendor Pods'
+
+# EN: true if a "marker" file confirms that folder $1 is regenerable.
+# FR: vrai si un fichier « marqueur » confirme que le dossier $1 est régénérable.
+has_marker() {
+  local dir="$1" parent name f
+  parent="${dir%/*}"; name="${dir##*/}"
+  case "$name" in
+    # EN: specific names, accepted alone / FR : noms spécifiques, acceptés seuls
+    node_modules|.gradle|.next|.nuxt|.turbo|.parcel-cache|.svelte-kit|.sass-cache|.tox|.nox|.pytest_cache|.mypy_cache|.ruff_cache|.ipynb_checkpoints|CMakeFiles|lua_modules|.terraform|.dart_tool) return 0 ;;
+    .venv|venv|env) [ -f "$dir/pyvenv.cfg" ] ;;                                   # Python
+    *.egg-info) [ -f "$parent/setup.py" ] || [ -f "$parent/pyproject.toml" ] ;;   # Python
+    target) [ -f "$parent/pom.xml" ] || [ -f "$parent/Cargo.toml" ] || [ -f "$parent/build.sbt" ] ;;   # Java, Rust, Scala
+    build)
+      for f in build.gradle build.gradle.kts settings.gradle settings.gradle.kts pom.xml package.json \
+               CMakeLists.txt Makefile meson.build setup.py pyproject.toml pubspec.yaml; do
+        [ -f "$parent/$f" ] && return 0
+      done
+      return 1 ;;
+    dist) [ -f "$parent/package.json" ] || [ -f "$parent/tsconfig.json" ] || [ -f "$parent/setup.py" ] || [ -f "$parent/pyproject.toml" ] ;;
+    out) [ -d "$parent/.idea" ] ;;                                                 # IntelliJ / CLion output
+    cmake-build-*) [ -f "$parent/CMakeLists.txt" ] ;;                              # CLion
+    builddir) [ -f "$parent/meson.build" ] ;;                                      # Meson
+    .cache) [ -f "$parent/CMakeLists.txt" ] || [ -f "$parent/compile_commands.json" ] ;;   # clangd index
+    .build) [ -f "$parent/Package.swift" ] ;;                                      # Swift Package Manager
+    .kotlin) [ -f "$parent/build.gradle.kts" ] || [ -f "$parent/settings.gradle.kts" ] ;;
+    .angular) [ -f "$parent/angular.json" ] ;;
+    vendor) [ -f "$parent/composer.json" ] || [ -f "$parent/go.mod" ] || [ -f "$parent/Gemfile" ] ;;   # PHP, Go, Ruby
+    Pods) [ -f "$parent/Podfile" ] ;;                                              # CocoaPods
+    *) return 1 ;;
+  esac
+}
+
+# EN: build find's "-name a -o -name b ..." arguments from a space-separated list, into the array NAME_ARGS.
+# FR: construit les arguments « -name a -o -name b ... » de find à partir d'une liste séparée par des espaces, dans le tableau NAME_ARGS.
+build_name_args() {
+  local names n first=1
+  NAME_ARGS=()
+  IFS=' ' read -r -a names <<< "$(printf '%s' "$1" | tr '\n' ' ')"
+  for n in "${names[@]}"; do
+    [ "$first" = 1 ] || NAME_ARGS+=(-o)
+    NAME_ARGS+=(-name "$n"); first=0
+  done
+}
+
+# EN: print (NUL-separated, parents before children) the candidate folders under $1; .git is not entered.
+#     Errors (e.g. "Operation not permitted") go to stderr and are reported by the caller.
+# FR: affiche (séparés par NUL, parents avant enfants) les dossiers candidats sous $1 ; .git n'est pas parcouru.
+#     Les erreurs (ex. « Operation not permitted ») vont sur stderr et sont signalées par l'appelant.
+find_candidates() {
+  local sure amb
+  build_name_args "$SCAN_NAMES_SURE"; sure=("${NAME_ARGS[@]}")
+  build_name_args "$SCAN_NAMES_AMBIGUOUS"; amb=("${NAME_ARGS[@]}")
+  find "$1" -xdev -name .git -prune -o -type d \
+    \( \( "${sure[@]}" \) -print0 -prune -o \( "${amb[@]}" \) -print0 \)
+}
+
+# EN: sticky exclusion = extended attribute set by "tmutil addexclusion" (a child of an excluded folder has none).
+# FR: exclusion sticky = attribut étendu posé par « tmutil addexclusion » (un enfant d'un dossier exclu n'en a pas).
+has_sticky_exclusion() { xattr "$1" 2>/dev/null | grep -Fxq 'com.apple.metadata:com_apple_backup_excludeItem'; }
+
+# EN: is_under LIST PATH: is PATH below one of the folders of LIST (one "folder/" per line).
+# FR: is_under LISTE CHEMIN : CHEMIN est-il sous l'un des dossiers de LISTE (un « dossier/ » par ligne).
+is_under() {
+  local a
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    case "$2/" in "$a"*) return 0 ;; esac
+  done <<EOF
+$1
+EOF
+  return 1
+}
+
+# EN: scan_build_dirs add|undo: walks the VISIBLE folders of the current user's home (not Library, not hidden
+#     folders, not .git, not folders already excluded as a whole: hundreds of GB of VMs/models would make the
+#     scan very slow). Prints "excluded: PATH" / "removed: PATH" / "FAILED ...". __pycache__ is ignored on
+#     purpose: tiny but thousands of them.
+# FR: scan_build_dirs add|undo : parcourt les dossiers VISIBLES du home de l'utilisateur (ni Library, ni dossiers
+#     cachés, ni .git, ni dossier déjà exclu en entier : des centaines de Go de VM/modèles rendraient le scan
+#     très lent). Affiche « excluded: CHEMIN » / « removed: CHEMIN » / « FAILED ... ». __pycache__ est ignoré
+#     volontairement : minuscule mais par milliers.
+scan_build_dirs() {
+  local mode="$1" root d err accepted
+  for root in "$HOME"/*/; do
+    root="${root%/}"
+    [ -d "$root" ] || continue
+    case "${root##*/}" in Library|Movies|Music|Pictures|Applications|Public) continue ;; esac
+    if [ "$mode" != undo ] && is_excluded "$root"; then continue; fi
+    accepted=""
+    while IFS= read -r -d '' d; do
+      # EN: skip anything below a folder already accepted (e.g. build/js/node_modules below build/).
+      # FR: ignore tout ce qui se trouve sous un dossier déjà retenu (ex. build/js/node_modules sous build/).
+      is_under "$accepted" "$d" && continue
+      has_marker "$d" || continue
+      accepted="$accepted$d/"$'\n'
+      if [ "$mode" = undo ]; then
+        has_sticky_exclusion "$d" || continue
+        if err="$(tmutil removeexclusion "$d" 2>&1)"; then echo "removed: $d"
+        else echo "FAILED to remove exclusion: $d (${err//$'\n'/ })"; fi
+      else
+        is_excluded "$d" && continue
+        if err="$(tmutil addexclusion "$d" 2>&1)"; then echo "excluded: $d"
+        else echo "FAILED to exclude: $d (${err//$'\n'/ })"; fi
+      fi
+    done < <(find_candidates "$root")
+  done
+  return 0
+}
+
+# EN: delete every local snapshot except the most recent one.
+# FR: supprime tous les snapshots locaux sauf le plus récent.
+prune_snapshots() {
+  local all d err
+  PRUNED=0; PRUNE_FAILED=0
+  all="$(tmutil listlocalsnapshotdates / 2>/dev/null | grep -E '^[0-9]{4}-' | sort)"
+  [ "$(printf '%s\n' "$all" | grep -c .)" -gt 1 ] || return 0
+  while IFS= read -r d; do
+    if err="$(tmutil deletelocalsnapshots "$d" 2>&1 >/dev/null)"; then log "snapshot deleted: $d"; PRUNED=$((PRUNED+1))
+    else log "FAILED to delete snapshot: $d (${err//$'\n'/ })"; PRUNE_FAILED=$((PRUNE_FAILED+1)); fi
+  done < <(printf '%s\n' "$all" | sed '$d')
+}
+
+# EN: hourly run, started by launchd (as the current user). Can be run by hand to test.
+#     A lock prevents two runs at the same time (RunAtLoad + manual run, for instance).
+# FR: passage horaire, lancé par launchd (sous l'utilisateur). Peut être lancé à la main pour tester.
+#     Un verrou empêche deux passages simultanés (RunAtLoad + lancement manuel, par exemple).
+cmd_run() {
+  if [ -z "${LTM_LOCKED:-}" ]; then
+    LTM_LOCKED=1 exec /usr/bin/lockf -t 0 "${TMPDIR:-/tmp}/leantimemachine.lock" /bin/bash "$SELF" run
+  fi
+  mkdir -p "$(dirname "$LOG")"
+  local out errf errf_copy n nerr tmp note=""
+  errf="$(mktemp)" || die "mktemp failed"
+  out="$(scan_build_dirs add 2>"$errf")"
+  n="$(printf '%s\n' "$out" | grep -c '^excluded: ')"
+  printf '%s\n' "$out" | grep . | while IFS= read -r l; do log "$l"; done
+  # EN: errors of find (e.g. "Operation not permitted" on Desktop without Full Disk Access) end up in the log.
+  # FR: les erreurs de find (ex. « Operation not permitted » sur Desktop sans Accès complet au disque) vont dans le journal.
+  sort -u "$errf" | grep . | while IFS= read -r l; do log "FAILED to scan: $l"; done
+  nerr=$(( $(printf '%s\n' "$out" | grep -c 'FAILED') + $(sort -u "$errf" | grep -c .) ))
+  errf_copy="$(mktemp)"; grep -E 'not permitted' "$errf" > "$errf_copy" 2>/dev/null
+  rm -f "$errf"
+  PRUNED=0; PRUNE_FAILED=0
+  if tmutil status 2>/dev/null | grep -q 'Running = 1'; then note=" (backup in progress: snapshots untouched)"
+  else prune_snapshots; fi
+  nerr=$((nerr + PRUNE_FAILED))
+  if [ "$nerr" = 0 ]; then log "run OK: $n folder(s) excluded, $PRUNED snapshot(s) deleted$note"
+  else log "run completed WITH $nerr ERROR(S): $n folder(s) excluded, $PRUNED snapshot(s) deleted$note"; fi
+  tmp="$(mktemp "$LOG.XXXXXX")" && tail -n 500 "$LOG" > "$tmp" && mv "$tmp" "$LOG"
+  # EN: said out loud when run from a terminal, so that a partial scan is never mistaken for a full one.
+  # FR: dit à voix haute quand lancé depuis un terminal, pour qu'un scan partiel ne soit jamais pris pour complet.
+  if [ -t 1 ] && [ -s "$errf_copy" ]; then echo; echo "! $(agent_fda_message)"; fi
+  rm -f "$errf_copy"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# install / uninstall
+# ---------------------------------------------------------------------------
+
+agent_plist_content() {
+  cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>$INSTALLED</string><string>run</string></array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict>
+</plist>
+PLIST
+}
+
+# EN: wait for the agent's first run (started by RunAtLoad) and make sure it could read the protected folders.
+#     Returns 1 (after explaining) if the run could not be confirmed or if macOS denied access.
+# FR: attend le premier passage de l'agent (lancé par RunAtLoad) et vérifie qu'il a pu lire les dossiers protégés.
+#     Renvoie 1 (après explication) si le passage n'a pu être confirmé ou si macOS a refusé l'accès.
+agent_first_run_check() {
+  local since="$1" i=0 lines
+  while [ "$i" -lt 20 ]; do
+    lines="$(awk -v s="$since" '($1" "$2) >= s' "$LOG" 2>/dev/null)"
+    if printf '%s\n' "$lines" | grep -q 'run OK\|run completed'; then
+      if printf '%s\n' "$lines" | grep -q 'not permitted'; then echo "! $(agent_fda_message)"; return 1; fi
+      echo "  $(T "OK: first run done, protected folders readable." "OK : premier passage effectué, dossiers protégés lisibles.")"; return 0
+    fi
+    sleep 1; i=$((i+1))
+  done
+  echo "! $(T "The agent's first run could not be confirmed within 20 s. Check: leantimemachine doctor" "Le premier passage de l'agent n'a pas pu être confirmé en 20 s. Vérifiez : leantimemachine doctor")"
+  return 1
+}
+
+cmd_install() {
+  local rc=0 warn=0 err started
+  require_config; require_fda   # EN: fail early, before changing anything / FR : échouer tôt, avant de rien modifier
+  echo "==> $(T "Installing the program in $APP_DIR" "Installation du programme dans $APP_DIR")"
+  mkdir -p "$APP_DIR" "$(dirname "$AGENT_PLIST")" "$(dirname "$LOG")" \
+    && install -m 755 "$SELF" "$INSTALLED" || die "$(T "copy failed" "copie impossible")"
+  echo "==> $(T "launchd agent $LABEL (every hour, as $(id -un), no root)" "Agent launchd $LABEL (toutes les heures, sous $(id -un), sans root)")"
+  started="$(date '+%Y-%m-%d %H:%M:%S')"
+  launchctl bootout "$AGENT_DOMAIN/$LABEL" 2>/dev/null
+  agent_plist_content > "$AGENT_PLIST" || die "$(T "could not write the plist" "écriture du plist impossible")"
+  launchctl bootstrap "$AGENT_DOMAIN" "$AGENT_PLIST" || die "$(T "launchctl bootstrap failed" "launchctl bootstrap a échoué")"
+  echo "==> $(T "Fixed-path exclusions (config/rules.conf) - sudo needed" "Exclusions de chemins fixes (config/rules.conf) - sudo nécessaire")"
+  cmd_apply || rc=1
+  if [ "$(defaults read "$PREFS" AutoBackup 2>/dev/null)" != 1 ]; then
+    echo "==> $(T "Time Machine was disabled: enabling it" "Time Machine était désactivé : activation")"
+    err="$(sudo tmutil enable 2>&1)" || { die_if_fda_error "$err"; show_err "$err"; rc=1; }
+  fi
+  echo "==> $(T "Checking the agent's first run (it must be able to read your folders)" "Vérification du premier passage de l'agent (il doit pouvoir lire vos dossiers)")"
+  agent_first_run_check "$started" || warn=1
+  echo
+  if [ "$rc" = 0 ] && [ "$warn" = 0 ]; then echo "$(T "Installation complete. Check with: leantimemachine doctor" "Installation terminée. Vérification : leantimemachine doctor")"
+  elif [ "$rc" = 0 ]; then echo "$(T "Installation complete, WITH A WARNING (see above). Check with: leantimemachine doctor" "Installation terminée, AVEC UN AVERTISSEMENT (voir plus haut). Vérification : leantimemachine doctor")"
+  else echo "$(T "Installation finished WITH ERRORS (see above). Check with: leantimemachine doctor" "Installation terminée AVEC DES ERREURS (voir plus haut). Vérification : leantimemachine doctor")"; fi
+  return "$rc"
+}
+
+cmd_uninstall() {
+  local rc=0
+  [ "$REMOVE_EXCL" = 1 ] && { require_config; require_fda; }   # EN: fail early / FR : échouer tôt
+  echo "==> $(T "Stopping and removing the agent" "Arrêt et suppression de l'agent")"
+  launchctl bootout "$AGENT_DOMAIN/$LABEL" 2>/dev/null
+  rm -f "$AGENT_PLIST" "$LOG"
+  rm -rf "$APP_DIR"
+  if [ "$REMOVE_EXCL" = 1 ]; then
+    echo "==> $(T "Removing the exclusions of project folders" "Retrait des exclusions des dossiers de projets")"
+    scan_build_dirs undo
+    echo "==> $(T "Removing the exclusions of rules.conf - sudo needed" "Retrait des exclusions de rules.conf - sudo nécessaire")"
+    cmd_remove || rc=1
+  fi
+  echo
+  if [ "$rc" = 0 ]; then echo "$(T "Uninstalled. Time Machine was not modified." "Désinstallé. Time Machine n'a pas été modifié.")"
+  else echo "$(T "Agent removed, but removing the exclusions FAILED (see above)." "Agent retiré, mais le retrait des exclusions a ÉCHOUÉ (voir plus haut).")"; fi
+  [ "$REMOVE_EXCL" = 1 ] || echo "$(T "Exclusions were kept (to remove them: leantimemachine uninstall --remove-exclusions)." "Les exclusions sont conservées (pour les retirer : leantimemachine uninstall --remove-exclusions).")"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+
+DOC_BAD=0; DOC_WARN=0
+d_ok()   { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+d_warn() { printf '  \033[33m!\033[0m %s\n      -> %s\n' "$1" "$2"; DOC_WARN=$((DOC_WARN+1)); }
+d_bad()  { printf '  \033[31m✗\033[0m %s\n      -> %s\n' "$1" "$2"; DOC_BAD=$((DOC_BAD+1)); }
+
+# EN: one line per destination: name, plugged in or not, date and age of the last backup.
+#     Read from the Time Machine preferences: never mounts a disk (unlike tmutil latestbackup).
+#     "Plugged in" is matched on the destination ID (unique), not on the volume name.
+# FR: une ligne par destination : nom, branchée ou non, date et âge de la dernière sauvegarde.
+#     Lu dans les préférences Time Machine : ne monte aucun disque (contrairement à tmutil latestbackup).
+#     « Branché » est reconnu par l'identifiant de destination (unique), pas par le nom du volume.
+tm_destinations_report() {
+  local xml n i name id last ts age_h age mounted_ids state
+  xml="$(defaults export "$PREFS" - 2>/dev/null)"
+  n="$(printf '%s' "$xml" | plutil -extract Destinations raw - 2>/dev/null)"
+  case "$n" in ''|*[!0-9]*|0)
+    d_bad "$(T "no backup destination configured" "aucune destination de sauvegarde configurée")" \
+          "$(T "System Settings > General > Time Machine > Add Backup Disk" "Réglages Système > Général > Time Machine > Ajouter un disque")"
+    return ;;
+  esac
+  mounted_ids="$(tmutil destinationinfo 2>/dev/null | awk -F' : ' '/^Mount Point/{m=1} /^ID/{if(m) print $2; m=0}')"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    name="$(printf '%s' "$xml" | plutil -extract "Destinations.$i.LastKnownVolumeName" raw - 2>/dev/null)"
+    name="${name:-destination $((i+1))}"
+    id="$(printf '%s' "$xml" | plutil -extract "Destinations.$i.DestinationID" raw - 2>/dev/null)"
+    last="$(printf '%s' "$xml" | plutil -extract "Destinations.$i.SnapshotDates" raw - 2>/dev/null)"
+    case "$last" in ''|*[!0-9]*|0) last="" ;; *) last="$(printf '%s' "$xml" | plutil -extract "Destinations.$i.SnapshotDates.$((last-1))" raw - 2>/dev/null)" ;; esac
+    if [ -n "$id" ] && printf '%s\n' "$mounted_ids" | grep -Fxq -- "$id"; then state="$(T "plugged in" "branché")"; else state="$(T "not plugged in" "non branché")"; fi
+    if [ -z "$last" ]; then
+      d_warn "$(T "$name ($state): no completed backup" "$name ($state) : aucune sauvegarde terminée")" \
+             "$(T "plug the disk in and let Time Machine make a first backup" "branchez le disque et laissez Time Machine faire une première sauvegarde")"
+    else
+      ts="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$last" +%s 2>/dev/null)"
+      age_h=$(( ( $(date +%s) - ${ts:-0} ) / 3600 ))
+      if [ "$age_h" -lt 48 ]; then age="$(T "${age_h} h ago" "il y a ${age_h} h")"; else age="$(T "$((age_h/24)) d ago" "il y a $((age_h/24)) j")"; fi
+      last="$(date -r "${ts:-0}" '+%Y-%m-%d %H:%M')"
+      if [ "$age_h" -gt 168 ]; then
+        d_warn "$(T "$name ($state): last backup $last ($age)" "$name ($state) : dernière sauvegarde $last ($age)")" \
+               "$(T "plug this disk in to update the backup" "branchez ce disque pour mettre à jour la sauvegarde")"
+      else d_ok "$(T "$name ($state): last backup $last ($age)" "$name ($state) : dernière sauvegarde $last ($age)")"; fi
+    fi
+    i=$((i+1))
+  done
+}
+
+cmd_doctor() {
+  local auto snaps owner me perms last last_ts age errs space since agent_ok=1
+  [ -f "$AGENT_PLIST" ] && [ -f "$INSTALLED" ] || agent_ok=0
+
+  echo "$(T "Terminal permissions" "Permissions du terminal")"
+  if has_fda; then d_ok "$(T "Full Disk Access granted to this terminal" "Accès complet au disque accordé à ce terminal")"
+  else d_warn "$(T "this terminal has no Full Disk Access (needed by apply, remove, install)" "ce terminal n'a pas l'Accès complet au disque (nécessaire pour apply, remove, install)")" \
+              "$(T "System Settings > Privacy & Security > Full Disk Access > add your terminal, then restart it" "Réglages Système > Confidentialité et sécurité > Accès complet au disque > ajoutez votre terminal, puis redémarrez-le")"; fi
+
+  echo; echo "Time Machine"
+  auto="$(defaults read "$PREFS" AutoBackup 2>/dev/null)"
+  if [ "$auto" = 1 ]; then d_ok "$(T "automatic backup enabled" "sauvegarde automatique activée")"
+  else d_bad "$(T "automatic backup DISABLED" "sauvegarde automatique DÉSACTIVÉE")" \
+             "sudo tmutil enable   $(T "(or System Settings > General > Time Machine)" "(ou Réglages Système > Général > Time Machine)")"; fi
+  tm_destinations_report
+
+  echo; echo "$(T "Local snapshots" "Snapshots locaux")"
+  snaps="$(tmutil listlocalsnapshotdates / 2>/dev/null | grep -cE '^[0-9]{4}-')"
+  if [ "$snaps" -le 1 ]; then d_ok "$(T "$snaps local snapshot" "$snaps snapshot local")"
+  elif [ "$agent_ok" = 0 ]; then
+    d_warn "$(T "$snaps local snapshots (goal: 1)" "$snaps snapshots locaux (objectif : 1)")" \
+           "$(T "nothing cleans them up until the agent is installed: leantimemachine install" "rien ne les nettoie tant que l'agent n'est pas installé : leantimemachine install")"
+  else d_warn "$(T "$snaps local snapshots (goal: 1)" "$snaps snapshots locaux (objectif : 1)")" \
+              "$(T "normal right after a backup; the agent cleans up at its next run (every hour). If it lasts: see the Log section below" "normal juste après une sauvegarde ; l'agent nettoie à son prochain passage (toutes les heures). Si ça dure : voir la section Journal ci-dessous")"; fi
+  space="$(df -h /System/Volumes/Data 2>/dev/null | awk -v f="$(T free libres)" -v u="$(T used utilisés)" 'NR==2{print $4" "f" ("$5" "u")"}')"
+  [ -n "$space" ] && d_ok "$(T "disk space:" "espace disque :") $space"
+
+  echo; echo "$(T "Background agent" "Agent en arrière-plan")"
+  if [ "$agent_ok" = 0 ]; then
+    d_bad "$(T "agent not installed" "agent non installé")" "leantimemachine install"
+  else
+    d_ok "$(T "agent installed" "agent installé") ($AGENT_PLIST)"
+    owner="$(stat -f '%Su' "$INSTALLED")"; perms="$(stat -f '%Sp' "$INSTALLED")"; me="$(id -un)"
+    if [ "$owner" != "$me" ] || [ "${perms:5:1}" = w ] || [ "${perms:8:1}" = w ]; then
+      d_bad "$(T "$INSTALLED is not owned by you or is writable by others" "$INSTALLED ne vous appartient pas ou est modifiable par d'autres")" "leantimemachine install"
+    fi
+    if [ "$SELF" != "$INSTALLED" ] && ! cmp -s "$SELF" "$INSTALLED"; then
+      d_warn "$(T "the installed copy differs from the project's" "la copie installée diffère de celle du projet")" \
+             "leantimemachine install   $(T "(copies the current version)" "(recopie la version à jour)")"
+    fi
+    if launchctl print "$AGENT_DOMAIN/$LABEL" >/dev/null 2>&1; then d_ok "$(T "agent loaded in launchd" "agent chargé dans launchd")"
+    else d_bad "$(T "agent not loaded in launchd" "agent non chargé dans launchd")" "launchctl bootstrap $AGENT_DOMAIN $AGENT_PLIST"; fi
+  fi
+
+  echo; echo "$(T "Log" "Journal") ($LOG)"
+  if [ "$agent_ok" = 0 ]; then
+    echo "  - $(T "none (the agent is not installed)" "aucun (l'agent n'est pas installé)")"
+  else
+    last="$(grep -E 'run (OK|completed)' "$LOG" 2>/dev/null | tail -n 1)"
+    if [ -z "$last" ]; then d_warn "$(T "no run recorded" "aucun passage enregistré")" "launchctl kickstart $AGENT_DOMAIN/$LABEL"
+    else
+      last_ts="$(date -j -f '%Y-%m-%d %H:%M:%S' "${last:0:19}" +%s 2>/dev/null)"
+      age=$(( ( $(date +%s) - ${last_ts:-0} ) / 60 ))
+      if [ "$age" -gt 130 ]; then
+        d_bad "$(T "last run ${age} min ago (expected: less than 60)" "dernier passage il y a ${age} min (attendu : moins de 60)")" \
+              "launchctl kickstart $AGENT_DOMAIN/$LABEL ; $(T "otherwise" "sinon") : leantimemachine install"
+      else d_ok "$(T "last run ${age} min ago" "dernier passage il y a ${age} min"): ${last:20}"; fi
+    fi
+    since="$(date -v-24H '+%Y-%m-%d %H:%M:%S')"
+    errs="$(awk -v s="$since" '($1" "$2) >= s' "$LOG" 2>/dev/null | grep -cE 'FAILED|not permitted|Operation not')"
+    if [ "$errs" -gt 0 ]; then
+      d_warn "$(T "$errs error(s) in the last 24 hours" "$errs erreur(s) dans les dernières 24 h")" \
+             "grep FAILED $LOG ; $(T "if 'Operation not permitted': System Settings > Privacy & Security > Full Disk Access > add /bin/bash" "si « Operation not permitted » : Réglages Système > Confidentialité et sécurité > Accès complet au disque > ajouter /bin/bash")"
+    else d_ok "$(T "no errors in the last 24 hours" "aucune erreur dans les dernières 24 h")"; fi
+  fi
+
+  echo; echo "Exclusions (config/rules.conf)"
+  if [ -f "$CONFIG" ]; then
+    classify_rules
+    if [ "$N_TODO" = 0 ]; then d_ok "$(T "all rules whose path exists are applied" "toutes les règles dont le chemin existe sont appliquées")"
+    else d_warn "$(T "$N_TODO existing path(s) of rules.conf still backed up" "$N_TODO chemin(s) existant(s) de rules.conf encore sauvegardé(s)")" \
+                "leantimemachine diff   $(T "then" "puis")   leantimemachine apply"; fi
+    if [ "$N_ABS_TODO" = 0 ]; then d_ok "$(T "all absent paths are registered ($N_ABS_DONE)" "tous les chemins absents sont inscrits ($N_ABS_DONE)")"
+    else d_warn "$(T "$N_ABS_TODO absent path(s) not registered yet (they will not be excluded when the software is installed)" "$N_ABS_TODO chemin(s) absent(s) pas encore inscrit(s) (ils ne seront pas exclus à l'installation du logiciel)")" \
+                "leantimemachine apply"; fi
+  else
+    d_warn "$(T "config not found ($CONFIG)" "config introuvable ($CONFIG)")" \
+           "$(T "run doctor from the project: ./bin/leantimemachine doctor" "lancez doctor depuis le projet : ./bin/leantimemachine doctor")"
+  fi
+
+  echo
+  if [ "$DOC_BAD" = 0 ] && [ "$DOC_WARN" = 0 ]; then echo "$(T "Everything is in order." "Tout est en ordre.")"
+  else echo "$(T "$DOC_BAD problem(s), $DOC_WARN warning(s)." "$DOC_BAD problème(s), $DOC_WARN avertissement(s).")"; fi
+  [ "$DOC_BAD" = 0 ]
+}
+
+case "$CMD" in
+  status) cmd_status ;;
+  apply) cmd_apply ;;
+  remove) cmd_remove ;;
+  list) cmd_list ;;
+  diff) cmd_diff ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  doctor) cmd_doctor ;;
+  run) cmd_run ;;
+esac

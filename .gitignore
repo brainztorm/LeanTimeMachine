@@ -1,0 +1,15 @@
+.DS_Store
+*.bak
+*.log
+*.tmp
+
+# dossiers créés par des outils d'édition / d'assistants (vides ou locaux)
+.agents/
+.gemini/
+.zed/
+.claude/
+.idea/
+.vscode/
+
+# notes de travail / revue interne (non publiées)
+ARGON_REVIEW.md

@@ -1,0 +1,28 @@
+#compdef leantimemachine
+# zsh completion for leantimemachine / autocomplétion zsh de leantimemachine
+_leantimemachine() {
+  local state ret=1
+  local -a cmds
+  cmds=(
+    'install:install the hourly agent, apply rules.conf, enable Time Machine'
+    'uninstall:remove the agent (Time Machine is left as is)'
+    'doctor:health check, tells you what to fix'
+    'run:run the agent hourly job now'
+    'status:state of every rules.conf rule'
+    'apply:apply the rules.conf exclusions'
+    'remove:remove the rules.conf exclusions'
+    'list:show SkipPaths'
+    'diff:rules to apply / already excluded'
+    'help:help'
+  )
+  _arguments -C \
+    '1:command:->cmd' \
+    '(-c --config)'{-c,--config}'[rules file]:file:_files' \
+    '(-h --help)'{-h,--help}'[show help]' \
+    '--no-size[status: do not compute sizes]' \
+    '--create[apply: create missing folders]' \
+    '--remove-exclusions[uninstall: also remove exclusions]' && ret=0
+  [[ $state == cmd ]] && _describe 'command' cmds && ret=0
+  return $ret
+}
+_leantimemachine "$@"
